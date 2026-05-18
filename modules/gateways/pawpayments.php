@@ -10,7 +10,7 @@ function pawpayments_MetaData()
 {
     return [
         'DisplayName' => 'PawPayments (Crypto)',
-        'APIVersion' => '1.1',
+        'APIVersion' => '2.0',
         'DisableLocalCreditCardInput' => true,
         'TokenisedStorage' => false,
     ];
