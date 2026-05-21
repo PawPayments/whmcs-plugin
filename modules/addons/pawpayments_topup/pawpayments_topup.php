@@ -56,6 +56,7 @@ function pawpayments_topup_deactivate()
 function pawpayments_topup_clientarea($vars)
 {
     require_once __DIR__ . '/../../gateways/pawpayments/vendor/pawpayments/sdk/src/Exception/PawPaymentsApiException.php';
+    require_once __DIR__ . '/../../gateways/pawpayments/vendor/pawpayments/sdk/src/Version.php';
     require_once __DIR__ . '/../../gateways/pawpayments/vendor/pawpayments/sdk/src/PawPaymentsClient.php';
 
     $moduleParams = $vars;

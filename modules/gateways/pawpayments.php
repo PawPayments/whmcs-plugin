@@ -3,6 +3,7 @@
 if (!defined("WHMCS")) die("This file cannot be accessed directly");
 
 require_once __DIR__ . '/pawpayments/vendor/pawpayments/sdk/src/Exception/PawPaymentsApiException.php';
+require_once __DIR__ . '/pawpayments/vendor/pawpayments/sdk/src/Version.php';
 require_once __DIR__ . '/pawpayments/vendor/pawpayments/sdk/src/PawPaymentsClient.php';
 require_once __DIR__ . '/pawpayments/vendor/pawpayments/sdk/src/Webhook.php';
 
