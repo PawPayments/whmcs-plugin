@@ -19,6 +19,11 @@ the on-chain payment confirms.
   `transactionId`; top-up uses the `mod_pawpayments_credits` table with
   `order_id` as the primary key.
 - Webhooks with `permanent_address_id` are silently acknowledged (200 OK).
+- **Payment-URL reuse** — the generated paywall link is cached for the invoice
+  TTL in the `mod_pawpayments_invoice_cache` table, so re-opening an unpaid
+  invoice reuses the same link instead of creating a new PawPayments invoice.
+  The table is created automatically on first use. Nothing is written to the
+  client-visible invoice notes.
 - Currency / network selection happens on the PawPayments paywall — the
   plugin does not need to know about supported assets.
 
@@ -28,8 +33,8 @@ the on-chain payment confirms.
 
 | Component | Minimum version |
 | --------- | --------------- |
-| WHMCS     | 8.x             |
-| PHP       | 7.4 (8.1+ recommended; WHMCS 8.x supports up to PHP 8.3) |
+| WHMCS     | 8.x or 9.x      |
+| PHP       | 7.4 on WHMCS 8.x (8.1+ recommended); **8.2+ on WHMCS 9.x**, which drops PHP 7.x/8.1 |
 | ionCube Loader | Required by WHMCS itself (not by this plugin) |
 | MySQL / MariaDB | Whatever WHMCS already uses |
 | PHP extensions | `curl`, `json`, `mbstring`, `openssl` |
@@ -212,6 +217,8 @@ Expected response: `OK` with HTTP 200, and the invoice changes to **Paid**.
 | Top-up addon not visible | Activate it in **Setup → Addon Modules** and grant access to your admin role. |
 | Top-up page errors with "Module Not Activated" | The gateway must be enabled (the addon falls back to the gateway's API key). |
 | Duplicate top-ups | The `mod_pawpayments_credits` table prevents double-credit on the same `order_id`. If the table is missing, re-activate the addon. |
+| Clients see a `{"pawpayments_url":…}` blob in the invoice notes | Left over from a release that cached the paywall link in `tblinvoices.notes`. Upgrade the gateway file — the cache now lives in `mod_pawpayments_invoice_cache`, and opening an affected invoice strips the blob automatically. |
+| A new PawPayments invoice is created on every page view | The `mod_pawpayments_invoice_cache` table could not be created (DB user lacks `CREATE`). Grant it, or create the table manually. |
 
 WHMCS gateway logs are at **Utilities → Logs → Gateway Log** (filter by
 `pawpayments`).
@@ -234,8 +241,9 @@ WHMCS gateway logs are at **Utilities → Logs → Gateway Log** (filter by
           modules/addons/pawpayments_topup
    ```
 
-4. Optionally drop the top-up bookkeeping table:
+4. Optionally drop the bookkeeping tables:
 
    ```sql
    DROP TABLE IF EXISTS mod_pawpayments_credits;
+   DROP TABLE IF EXISTS mod_pawpayments_invoice_cache;
    ```

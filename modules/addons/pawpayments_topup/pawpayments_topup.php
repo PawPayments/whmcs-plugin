@@ -13,7 +13,7 @@ function pawpayments_topup_config()
     return [
         'name' => 'PawPayments Crypto Deposit',
         'description' => 'Allows clients to add funds via cryptocurrency through PawPayments',
-        'version' => '2.0.1',
+        'version' => '2.0.2',
         'author' => 'PawPayments',
         'fields' => [
             'api_key' => [

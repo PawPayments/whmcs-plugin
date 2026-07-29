@@ -52,6 +52,10 @@ function pawpayments_config()
     ];
 }
 
+if (!defined('PAWPAYMENTS_CACHE_TABLE')) {
+    define('PAWPAYMENTS_CACHE_TABLE', 'mod_pawpayments_invoice_cache');
+}
+
 function pawpayments_link($params)
 {
     $apiKey = $params['api_key'];
@@ -61,6 +65,10 @@ function pawpayments_link($params)
     $invoiceId = $params['invoiceid'];
     $amount = $params['amount'];
     $currency = $params['currency'];
+
+    // Older releases cached the payment URL in tblinvoices.notes, which WHMCS
+    // renders on the client-facing invoice. Clean it up as invoices are viewed.
+    _pawpayments_strip_legacy_notes($invoiceId);
 
     $cachedUrl = _pawpayments_get_cached_url($invoiceId, $ttl);
     if ($cachedUrl) {
@@ -102,36 +110,106 @@ function pawpayments_link($params)
     return '<a href="' . htmlspecialchars($paymentUrl) . '" class="btn btn-primary">Pay with Crypto</a>';
 }
 
+/**
+ * Lazily create the payment-URL cache table. Gateway modules have no activation
+ * hook in WHMCS, so the table is provisioned on first use.
+ */
+function _pawpayments_cache_table_ready(): bool
+{
+    static $ready = null;
+    if ($ready !== null) {
+        return $ready;
+    }
+
+    try {
+        $schema = \Illuminate\Database\Capsule\Manager::schema();
+        if (!$schema->hasTable(PAWPAYMENTS_CACHE_TABLE)) {
+            $schema->create(PAWPAYMENTS_CACHE_TABLE, function ($table) {
+                $table->integer('invoice_id')->unsigned()->primary();
+                $table->text('payment_url');
+                $table->integer('created_at')->unsigned();
+            });
+        }
+        $ready = true;
+    } catch (\Exception $e) {
+        $ready = false;
+    }
+
+    return $ready;
+}
+
 function _pawpayments_get_cached_url(int $invoiceId, int $ttl): ?string
 {
+    if (!_pawpayments_cache_table_ready()) {
+        return null;
+    }
+
     try {
-        $invoice = \WHMCS\Billing\Invoice::find($invoiceId);
-        if ($invoice && $invoice->notes) {
-            $cached = json_decode($invoice->notes, true);
-            if (is_array($cached)
-                && !empty($cached['pawpayments_url'])
-                && !empty($cached['pawpayments_ts'])
-                && (time() - $cached['pawpayments_ts']) < $ttl
-            ) {
-                return $cached['pawpayments_url'];
-            }
+        $row = \Illuminate\Database\Capsule\Manager::table(PAWPAYMENTS_CACHE_TABLE)
+            ->where('invoice_id', $invoiceId)
+            ->first();
+
+        if ($row && $row->payment_url && (time() - (int) $row->created_at) < $ttl) {
+            return $row->payment_url;
         }
     } catch (\Exception $e) {
     }
+
     return null;
 }
 
 function _pawpayments_cache_url(int $invoiceId, string $url): void
 {
+    if (!_pawpayments_cache_table_ready()) {
+        return;
+    }
+
     try {
-        $invoice = \WHMCS\Billing\Invoice::find($invoiceId);
-        if ($invoice) {
-            $existing = json_decode($invoice->notes, true) ?: [];
-            $existing['pawpayments_url'] = $url;
-            $existing['pawpayments_ts'] = time();
-            $invoice->notes = json_encode($existing);
-            $invoice->save();
+        $row = ['payment_url' => $url, 'created_at' => time()];
+        $query = \Illuminate\Database\Capsule\Manager::table(PAWPAYMENTS_CACHE_TABLE)
+            ->where('invoice_id', $invoiceId);
+
+        if ($query->exists()) {
+            $query->update($row);
+        } else {
+            \Illuminate\Database\Capsule\Manager::table(PAWPAYMENTS_CACHE_TABLE)
+                ->insert($row + ['invoice_id' => $invoiceId]);
         }
+    } catch (\Exception $e) {
+    }
+}
+
+/**
+ * Remove the payment-URL blob older releases wrote into the client-visible
+ * invoice notes. Only touches notes that are a JSON object carrying our keys,
+ * so hand-written notes are left alone.
+ */
+function _pawpayments_strip_legacy_notes(int $invoiceId): void
+{
+    try {
+        $notes = \Illuminate\Database\Capsule\Manager::table('tblinvoices')
+            ->where('id', $invoiceId)
+            ->value('notes');
+
+        if (!$notes) {
+            return;
+        }
+
+        $decoded = json_decode($notes, true);
+        if (!is_array($decoded)) {
+            return;
+        }
+        if (!array_key_exists('pawpayments_url', $decoded)
+            && !array_key_exists('pawpayments_ts', $decoded)
+        ) {
+            return;
+        }
+
+        unset($decoded['pawpayments_url'], $decoded['pawpayments_ts']);
+
+        \Illuminate\Database\Capsule\Manager::table('tblinvoices')
+            ->where('id', $invoiceId)
+            ->update(['notes' => $decoded ? json_encode($decoded) : '']);
     } catch (\Exception $e) {
     }
 }
