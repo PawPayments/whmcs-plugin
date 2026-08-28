@@ -84,7 +84,10 @@ function pawpayments_link($params)
             'extra' => (string) $invoiceId,
             'amount' => (float) $amount,
             'fiat_currency' => $currency,
-            'billing_type' => 'VARY',
+            // Fixed-price order: STATIC keeps the invoice open after an underpayment so the
+            // customer can top it up; VARY (right for balance top-ups) finalises on the
+            // first payment, making a shortfall terminal.
+            'billing_type' => 'STATIC',
             'ttl' => $ttl,
             'on_paid_url' => $params['returnurl'],
             'on_cancel_url' => $params['returnurl'],

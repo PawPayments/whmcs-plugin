@@ -38,7 +38,14 @@ if (!empty($payload['permanent_address_id'])) {
 $invoiceId = $payload['extra'] ?? '';
 $orderId = $payload['order_id'] ?? '';
 $status = $payload['status'] ?? '';
-$fiatAmount = $payload['fiat_amount'] ?? $payload['amount'] ?? 0;
+// `fiat_amount` is what the deposit was worth when credited (live rate, net of
+// commission); on a settled invoice it can land a fraction under the amount the
+// invoice was issued for, and booking that leaves the invoice Unpaid over cents.
+// Only used on success/paid_over below, so the larger of the two is correct.
+$fiatAmount = max(
+    (float) ($payload['fiat_amount'] ?? 0),
+    (float) ($payload['initial_fiat_amount'] ?? 0)
+);
 
 if (!$invoiceId || !$orderId) {
     http_response_code(400);
