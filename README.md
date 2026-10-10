@@ -15,9 +15,23 @@ the on-chain payment confirms.
   one-time invoice via `POST /api/v2/invoices`.
 - **Signature verification** — all webhooks are verified via `X-Paw-Signature`
   (HMAC-SHA256 of the raw body); requests without a valid header are rejected with HTTP 401.
-- **Idempotent** — checkout uses `addInvoicePayment` deduplication by
-  `transactionId`; top-up uses the `mod_pawpayments_credits` table with
-  `order_id` as the primary key.
+  Checkout webhooks use the gateway's API key; top-up webhooks use the key the
+  deposit was created with (the addon's own key, else the gateway's). While
+  that key is empty, the endpoint answers HTTP 503.
+- **Amount check** — a paid checkout webhook is applied only when it is in the
+  invoice's currency and covers its total (within the invoice's underpay
+  tolerance); otherwise it is logged and answered with HTTP 409.
+- **Idempotent** — `addInvoicePayment` itself does **not** deduplicate, so
+  checkout first checks `tblaccounts` for the PawPayments `order_id` and logs a
+  repeated delivery instead of booking it again; top-up uses the
+  `mod_pawpayments_credits` table with `order_id` as the primary key.
+- **Late and partial payments** — a crypto payment for an invoice meanwhile
+  paid another way is still booked (WHMCS turns the surplus into client
+  credit); an invoice that expired after a partial payment (`cancelled`) gets
+  that partial booked.
+- **Top-up currency** — a top-up is always issued in the client's own WHMCS
+  currency (clients whose currency PawPayments does not support cannot use
+  it), and the webhook is refused unless its `fiat_currency` matches.
 - Webhooks with `permanent_address_id` are silently acknowledged (200 OK).
 - **Payment-URL reuse** — the generated paywall link is cached for the invoice
   TTL in the `mod_pawpayments_invoice_cache` table, so re-opening an unpaid
@@ -57,8 +71,9 @@ installation tree:
 modules/
 ├── gateways/
 │   ├── pawpayments.php                          ← gateway entry point
-│   ├── pawpayments/                             ← vendored SDK
-│   │   └── vendor/pawpayments/sdk/...
+│   ├── pawpayments/
+│   │   ├── pawpayments_common.php               ← webhook rules shared by both callbacks
+│   │   └── vendor/pawpayments/sdk/...           ← vendored SDK
 │   └── callback/
 │       ├── pawpayments.php                      ← checkout webhook
 │       └── pawpayments_topup.php                ← top-up webhook
@@ -194,7 +209,8 @@ checkout one. Make sure both endpoints are publicly reachable over HTTPS.
 ORDER_ID="<paw_order_id>"
 INVOICE_ID="<whmcs_invoice_id>"
 KEY="<your_api_key>"
-BODY="{\"order_id\":\"$ORDER_ID\",\"extra\":\"$INVOICE_ID\",\"status\":\"success\",\"fiat_amount\":\"15\",\"asset\":\"USDT\"}"
+# fiat_amount / fiat_currency must cover the invoice total in the client's currency
+BODY="{\"order_id\":\"$ORDER_ID\",\"extra\":\"$INVOICE_ID\",\"status\":\"success\",\"fiat_amount\":\"15\",\"fiat_currency\":\"USD\",\"asset\":\"USDT\"}"
 SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$KEY" | awk '{print $2}')
 curl -X POST "https://<your-whmcs>/modules/gateways/callback/pawpayments.php" \
   -H "Content-Type: application/json" \
@@ -213,9 +229,11 @@ Expected response: `OK` with HTTP 200, and the invoice changes to **Paid**.
 | Gateway not in the list at **Setup → Payments → Payment Gateways** | Files not uploaded or wrong path. Re-check that `modules/gateways/pawpayments.php` exists and is readable by the web user. |
 | `Failed to create payment: Invalid API key` on the invoice page | API key wrong or merchant not activated. |
 | Webhook returns HTTP 500 with `Failed to open required init.php` | Old plugin version. The current callback uses `require_once __DIR__ . '/../../../init.php';` (three `..`, not four). Re-upload the latest `callback/pawpayments*.php`. |
-| Webhook returns HTTP 401 `Invalid signature` | The API key in the gateway settings does not match the key used to create the invoice. Update the gateway settings and re-issue the invoice. |
+| Webhook returns HTTP 503 `Gateway not configured` | The **API Key** field of the PawPayments gateway is empty. Fill it in. |
+| Webhook returns HTTP 401 `Invalid signature` | The API key in the gateway settings (for top-ups: the addon's key, else the gateway's) does not match the key used to create the invoice. Update the settings and re-issue the invoice. |
+| Checkout webhook returns HTTP 409 | The paid PawPayments invoice is in another currency than the WHMCS invoice or does not cover its total. The Gateway Log has the amounts; apply the payment by hand if appropriate. |
 | Top-up addon not visible | Activate it in **Setup → Addon Modules** and grant access to your admin role. |
-| Top-up page errors with "Module Not Activated" | The gateway must be enabled (the addon falls back to the gateway's API key). |
+| Top-up webhook returns HTTP 503 | Neither the addon nor the gateway has an API key. Set one (the addon falls back to the gateway's key). |
 | Duplicate top-ups | The `mod_pawpayments_credits` table prevents double-credit on the same `order_id`. If the table is missing, re-activate the addon. |
 | Clients see a `{"pawpayments_url":…}` blob in the invoice notes | Left over from a release that cached the paywall link in `tblinvoices.notes`. Upgrade the gateway file — the cache now lives in `mod_pawpayments_invoice_cache`, and opening an affected invoice strips the blob automatically. |
 | A new PawPayments invoice is created on every page view | The `mod_pawpayments_invoice_cache` table could not be created (DB user lacks `CREATE`). Grant it, or create the table manually. |
@@ -247,3 +265,21 @@ WHMCS gateway logs are at **Utilities → Logs → Gateway Log** (filter by
    DROP TABLE IF EXISTS mod_pawpayments_credits;
    DROP TABLE IF EXISTS mod_pawpayments_invoice_cache;
    ```
+
+---
+
+## Tests
+
+`tests/` (not part of the plugin zip) holds a PHPUnit suite for the rules that
+move money, kept free of WHMCS in `pawpayments_common.php`: webhook
+verification (empty key, bad or missing signature, permanent-address
+deposits), what the checkout callback books (currency and amount check, the
+issued amount on a settled invoice, repeated deliveries, partials after
+expiry) and what the top-up callback credits (client currency only, fiat
+amount only, refusals answered 200 so they are not retried), plus which API key
+top-up webhooks are verified with.
+
+```bash
+cd tests
+phpunit -c phpunit.xml.dist        # PHPUnit 9; runs on PHP 7.4 and 8.x
+```

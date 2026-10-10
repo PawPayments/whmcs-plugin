@@ -13,6 +13,8 @@
                 Deposit was cancelled.
             </div>
             <a href="index.php?m=pawpayments_topup" class="btn btn-primary">Try Again</a>
+        {elseif $unsupported}
+            <div class="alert alert-danger">{$error}</div>
         {else}
             {if $error}
                 <div class="alert alert-danger">{$error}</div>
@@ -26,12 +28,8 @@
                            placeholder="Enter amount">
                 </div>
                 <div class="form-group mb-3">
-                    <label for="currency">Currency</label>
-                    <select class="form-control" id="currency" name="currency">
-                        {foreach from=$supported_fiats item=fiat}
-                            <option value="{$fiat}" {if $currency == $fiat}selected{/if}>{$fiat}</option>
-                        {/foreach}
-                    </select>
+                    <label>Currency</label>
+                    <p class="form-control-plaintext">{$currency|escape}</p>
                 </div>
                 <button type="submit" class="btn btn-primary">
                     Continue to Payment

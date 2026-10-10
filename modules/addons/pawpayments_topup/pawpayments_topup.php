@@ -2,6 +2,8 @@
 
 if (!defined("WHMCS")) die("This file cannot be accessed directly");
 
+require_once __DIR__ . '/../../gateways/pawpayments/pawpayments_common.php';
+
 const PAWPAYMENTS_SUPPORTED_FIATS = [
     'USD', 'EUR', 'GBP', 'CAD', 'AUD', 'CHF', 'JPY', 'NZD', 'SGD', 'HKD',
     'NGN', 'KRW', 'ILS', 'RON', 'ARS', 'INR', 'IDR', 'MXN', 'MYR', 'TRY',
@@ -53,63 +55,88 @@ function pawpayments_topup_deactivate()
     return ['status' => 'success', 'description' => 'PawPayments Topup module deactivated'];
 }
 
+/**
+ * API key and base URL deposit invoices are created with, and their webhooks
+ * verified with: the addon's own settings, else the gateway's. Shared with the
+ * top-up callback, so both always use the same key.
+ *
+ * @param array|null $settings The addon settings (null: read them from WHMCS)
+ */
+function pawpayments_topup_credentials(?array $settings = null): array
+{
+    if ($settings === null) {
+        $settings = \Illuminate\Database\Capsule\Manager::table('tbladdonmodules')
+            ->where('module', 'pawpayments_topup')
+            ->pluck('value', 'setting')
+            ->all();
+    }
+
+    $apiKey = (string) ($settings['api_key'] ?? '');
+    $baseUrl = (string) ($settings['api_base_url'] ?? '') ?: 'https://api.pawpayments.com';
+
+    if ($apiKey === '') {
+        $gateway = getGatewayVariables('pawpayments');
+        $apiKey = (string) ($gateway['api_key'] ?? '');
+        $baseUrl = ($gateway['api_base_url'] ?? '') ?: $baseUrl;
+    }
+
+    return ['api_key' => $apiKey, 'api_base_url' => $baseUrl];
+}
+
+/** The deposit page with $vars. */
+function pawpayments_topup_page(array $vars): array
+{
+    return [
+        'pagetitle' => 'Crypto Deposit',
+        'breadcrumb' => ['index.php?m=pawpayments_topup' => 'Crypto Deposit'],
+        'templatefile' => 'templates/topup',
+        'vars' => $vars,
+    ];
+}
+
 function pawpayments_topup_clientarea($vars)
 {
     require_once __DIR__ . '/../../gateways/pawpayments/vendor/pawpayments/sdk/src/Exception/PawPaymentsApiException.php';
     require_once __DIR__ . '/../../gateways/pawpayments/vendor/pawpayments/sdk/src/Version.php';
     require_once __DIR__ . '/../../gateways/pawpayments/vendor/pawpayments/sdk/src/PawPaymentsClient.php';
 
-    $moduleParams = $vars;
-    $apiKey = $moduleParams['api_key'] ?? '';
-    $baseUrl = $moduleParams['api_base_url'] ?? 'https://api.pawpayments.com';
-
-    if (!$apiKey) {
-        $gateway = getGatewayVariables('pawpayments');
-        $apiKey = $gateway['api_key'] ?? '';
-        $baseUrl = $gateway['api_base_url'] ?: $baseUrl;
-    }
+    $credentials = pawpayments_topup_credentials($vars);
 
     $clientId = (int) $_SESSION['uid'];
     if (!$clientId) {
-        return ['pagetitle' => 'Crypto Deposit', 'breadcrumb' => ['index.php?m=pawpayments_topup' => 'Crypto Deposit'], 'vars' => ['error' => 'Not authenticated']];
+        return pawpayments_topup_page(['error' => 'Not authenticated']);
     }
 
     if (isset($_GET['deposited'])) {
-        return [
-            'pagetitle' => 'Crypto Deposit',
-            'breadcrumb' => ['index.php?m=pawpayments_topup' => 'Crypto Deposit'],
-            'templatefile' => 'templates/topup',
-            'vars' => ['success' => true],
-        ];
+        return pawpayments_topup_page(['success' => true]);
     }
 
     if (isset($_GET['cancelled'])) {
-        return [
-            'pagetitle' => 'Crypto Deposit',
-            'breadcrumb' => ['index.php?m=pawpayments_topup' => 'Crypto Deposit'],
-            'templatefile' => 'templates/topup',
-            'vars' => ['cancelled' => true],
-        ];
+        return pawpayments_topup_page(['cancelled' => true]);
+    }
+
+    $currency = pawpayments_client_currency($clientId);
+    if (!in_array($currency, PAWPAYMENTS_SUPPORTED_FIATS, true)) {
+        return pawpayments_topup_page([
+            'unsupported' => true,
+            'error' => 'Crypto deposits are not available for your account currency'
+                . ($currency !== '' ? ' (' . $currency . ')' : '') . '.',
+        ]);
     }
 
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_POST['amount'])) {
         $amount = (float) $_POST['amount'];
-        $postedCurrency = strtoupper($_POST['currency'] ?? '');
-        $currency = in_array($postedCurrency, PAWPAYMENTS_SUPPORTED_FIATS, true) ? $postedCurrency : 'USD';
 
         if ($amount < 1 || $amount > 100000) {
-            return [
-                'pagetitle' => 'Crypto Deposit',
-                'breadcrumb' => ['index.php?m=pawpayments_topup' => 'Crypto Deposit'],
-                'templatefile' => 'templates/topup',
-                'vars' => ['error' => 'Amount must be between 1 and 100,000', 'amount' => $amount, 'currency' => $currency, 'supported_fiats' => PAWPAYMENTS_SUPPORTED_FIATS],
-            ];
+            return pawpayments_topup_page([
+                'error' => 'Amount must be between 1 and 100,000', 'amount' => $amount, 'currency' => $currency,
+            ]);
         }
 
         $systemUrl = \App::getSystemURL();
         $callbackUrl = $systemUrl . 'modules/gateways/callback/pawpayments_topup.php';
 
-        $client = new \PawPayments\Sdk\PawPaymentsClient($apiKey, $baseUrl);
+        $client = new \PawPayments\Sdk\PawPaymentsClient($credentials['api_key'], $credentials['api_base_url']);
 
         try {
             $data = $client->createInvoice([
@@ -133,19 +160,11 @@ function pawpayments_topup_clientarea($vars)
                 exit;
             }
         } catch (\PawPayments\Sdk\Exception\PawPaymentsApiException $e) {
-            return [
-                'pagetitle' => 'Crypto Deposit',
-                'breadcrumb' => ['index.php?m=pawpayments_topup' => 'Crypto Deposit'],
-                'templatefile' => 'templates/topup',
-                'vars' => ['error' => 'Payment error: ' . $e->getMessage(), 'amount' => $amount, 'currency' => $currency, 'supported_fiats' => PAWPAYMENTS_SUPPORTED_FIATS],
-            ];
+            return pawpayments_topup_page([
+                'error' => 'Payment error: ' . $e->getMessage(), 'amount' => $amount, 'currency' => $currency,
+            ]);
         }
     }
 
-    return [
-        'pagetitle' => 'Crypto Deposit',
-        'breadcrumb' => ['index.php?m=pawpayments_topup' => 'Crypto Deposit'],
-        'templatefile' => 'templates/topup',
-        'vars' => ['amount' => '', 'currency' => 'USD', 'supported_fiats' => PAWPAYMENTS_SUPPORTED_FIATS],
-    ];
+    return pawpayments_topup_page(['amount' => '', 'currency' => $currency]);
 }
