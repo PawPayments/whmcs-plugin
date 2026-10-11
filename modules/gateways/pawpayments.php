@@ -6,6 +6,7 @@ require_once __DIR__ . '/pawpayments/vendor/pawpayments/sdk/src/Exception/PawPay
 require_once __DIR__ . '/pawpayments/vendor/pawpayments/sdk/src/Version.php';
 require_once __DIR__ . '/pawpayments/vendor/pawpayments/sdk/src/PawPaymentsClient.php';
 require_once __DIR__ . '/pawpayments/vendor/pawpayments/sdk/src/Webhook.php';
+require_once __DIR__ . '/pawpayments/pawpayments_common.php';
 
 function pawpayments_MetaData()
 {
@@ -107,6 +108,19 @@ function pawpayments_link($params)
     if (!$paymentUrl) {
         return '<div class="alert alert-danger">No payment URL returned</div>';
     }
+
+    // What the callback will check this PawPayments invoice against: $amount
+    // is the balance due, in $currency — the client's own, or the one
+    // "Convert To For Processing" turned it into — so keep the balance in the
+    // client's currency too, which also fixes the rate to book it back at.
+    $invoice = localAPI('GetInvoice', ['invoiceid' => $invoiceId]);
+    pawpayments_record_issued_invoice(
+        (string) ($data['order_id'] ?? ''),
+        (int) $invoiceId,
+        (float) $amount,
+        (string) $currency,
+        is_numeric($invoice['balance'] ?? null) ? (float) $invoice['balance'] : (float) $amount
+    );
 
     _pawpayments_cache_url($invoiceId, $paymentUrl);
 

@@ -18,17 +18,31 @@ the on-chain payment confirms.
   Checkout webhooks use the gateway's API key; top-up webhooks use the key the
   deposit was created with (the addon's own key, else the gateway's). While
   that key is empty, the endpoint answers HTTP 503.
-- **Amount check** — a paid checkout webhook is applied only when it is in the
-  invoice's currency and covers its total (within the invoice's underpay
-  tolerance); otherwise it is logged and answered with HTTP 409.
+- **Amount check** — every PawPayments invoice the gateway creates is recorded
+  in `mod_pawpayments_invoices` with the WHMCS invoice it is for, the amount
+  and currency asked for (the balance due at that moment) and that balance in
+  the client's currency. A paid checkout webhook is applied only for the WHMCS
+  invoice its PawPayments invoice was created for, in that currency, and only
+  if that invoice was issued for that amount; otherwise it is logged and
+  answered with HTTP 409. Whether enough arrived is the gateway's call —
+  `success` already means "within your underpay tolerance". Invoices created
+  before 2.1 have no record and are checked against what is still due, in the
+  client's currency.
+- **Convert To For Processing** — supported: when the gateway converts the
+  invoice into another currency, the payment is booked back in the client's
+  currency at the rate used when the payment link was created.
 - **Idempotent** — `addInvoicePayment` itself does **not** deduplicate, so
-  checkout first checks `tblaccounts` for the PawPayments `order_id` and logs a
-  repeated delivery instead of booking it again; top-up uses the
-  `mod_pawpayments_credits` table with `order_id` as the primary key.
+  checkout books only the difference between what the PawPayments invoice has
+  paid and what is already in `tblaccounts` for it (a repeated delivery books
+  nothing), under a MySQL named lock so two deliveries at once cannot both
+  book; top-up uses the `mod_pawpayments_credits` table with `order_id` as
+  the primary key.
 - **Late and partial payments** — a crypto payment for an invoice meanwhile
   paid another way is still booked (WHMCS turns the surplus into client
   credit); an invoice that expired after a partial payment (`cancelled`) gets
-  that partial booked.
+  that partial booked, and if the rest is later paid into the same
+  PawPayments invoice the difference is booked too, as transaction
+  `<order_id>-2`.
 - **Top-up currency** — a top-up is always issued in the client's own WHMCS
   currency (clients whose currency PawPayments does not support cannot use
   it), and the webhook is refused unless its `fiat_currency` matches.
@@ -237,6 +251,7 @@ Expected response: `OK` with HTTP 200, and the invoice changes to **Paid**.
 | Duplicate top-ups | The `mod_pawpayments_credits` table prevents double-credit on the same `order_id`. If the table is missing, re-activate the addon. |
 | Clients see a `{"pawpayments_url":…}` blob in the invoice notes | Left over from a release that cached the paywall link in `tblinvoices.notes`. Upgrade the gateway file — the cache now lives in `mod_pawpayments_invoice_cache`, and opening an affected invoice strips the blob automatically. |
 | A new PawPayments invoice is created on every page view | The `mod_pawpayments_invoice_cache` table could not be created (DB user lacks `CREATE`). Grant it, or create the table manually. |
+| Paid invoices answered with 409 after a "Convert To For Processing" change | Payments are checked against the currency their payment link was created in. Links made before the gateway kept `mod_pawpayments_invoices` (or if the DB user cannot create it) are checked in the client's currency, so a converted one cannot match: apply that payment by hand. |
 
 WHMCS gateway logs are at **Utilities → Logs → Gateway Log** (filter by
 `pawpayments`).
@@ -264,6 +279,7 @@ WHMCS gateway logs are at **Utilities → Logs → Gateway Log** (filter by
    ```sql
    DROP TABLE IF EXISTS mod_pawpayments_credits;
    DROP TABLE IF EXISTS mod_pawpayments_invoice_cache;
+   DROP TABLE IF EXISTS mod_pawpayments_invoices;
    ```
 
 ---
@@ -273,9 +289,11 @@ WHMCS gateway logs are at **Utilities → Logs → Gateway Log** (filter by
 `tests/` (not part of the plugin zip) holds a PHPUnit suite for the rules that
 move money, kept free of WHMCS in `pawpayments_common.php`: webhook
 verification (empty key, bad or missing signature, permanent-address
-deposits), what the checkout callback books (currency and amount check, the
-issued amount on a settled invoice, repeated deliveries, partials after
-expiry) and what the top-up callback credits (client currency only, fiat
+deposits), what the checkout callback books (the PawPayments invoice's own
+record or, without one, what is due; currency and amount check; Convert To
+For Processing; the issued amount on a settled invoice; only the difference on
+a repeated delivery or a later top-up; partials after expiry) and what the
+top-up callback credits (client currency only, fiat
 amount only, refusals answered 200 so they are not retried), plus which API key
 top-up webhooks are verified with.
 

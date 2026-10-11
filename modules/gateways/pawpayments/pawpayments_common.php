@@ -64,47 +64,79 @@ function pawpayments_verified_payload(string $apiKey): array
 }
 
 /**
- * What the checkout callback does with a verified webhook for one invoice.
+ * What the checkout callback does with a verified webhook for WHMCS invoice
+ * $invoiceId (its `extra`).
  *
- * `book` is the amount to pass to addInvoicePayment(), or null to book nothing;
- * `log` is the logTransaction() result; `http`/`body` the response. The
- * invoice facts are only consulted for PAWPAYMENTS_SETTLING_STATUSES.
+ * `book` is the amount, in the client's currency, to pass to
+ * addInvoicePayment() now, or null to book nothing; `log` is the
+ * logTransaction() result; `http`/`body` the response.
  *
- * @param mixed $invoiceTotal The invoice total as WHMCS reports it
- * @param string $clientCurrency ISO code of the invoice's (its client's) currency
- * @param bool $alreadyRecorded Whether this webhook's order_id is already booked
+ * The reference is the PawPayments invoice this plugin created for the WHMCS
+ * invoice ($issued, see pawpayments_record_issued_invoice()): the payment must
+ * be in its currency and the invoice issued for its amount — the balance due
+ * when the link was made, possibly converted by WHMCS's "Convert To For
+ * Processing" — and is booked back at the rate of that moment. Without a
+ * record (an invoice created before records were kept) only a payment in the
+ * client's currency, issued for at least what is still due, qualifies.
+ *
+ * Bookings are cumulative per PawPayments invoice: $booked is what is already
+ * booked for it, and only the difference is booked, so a repeated delivery
+ * books nothing and a later top-up of an invoice that expired after a partial
+ * payment books the rest.
+ *
+ * @param array|null $issued ['invoice_id', 'amount', 'currency', 'client_amount']
+ * @param mixed $balance What is due on the invoice now, in the client's currency
+ * @param string $clientCurrency ISO code of the client's (the invoice's) currency
+ * @param float $booked Already booked on the invoice for this PawPayments invoice
  * @return array{book: ?float, http: int, body: string, log: string}
  */
 function pawpayments_checkout_action(
     array $payload,
-    $invoiceTotal,
+    int $invoiceId,
+    ?array $issued,
+    $balance,
     string $clientCurrency,
-    bool $alreadyRecorded
+    float $booked
 ): array {
     $status = (string) ($payload['status'] ?? '');
+    $orderId = (string) ($payload['order_id'] ?? '');
     $noop = ['book' => null, 'http' => 200, 'body' => 'OK'];
+
+    if ($issued !== null && (int) $issued['invoice_id'] !== $invoiceId) {
+        return [
+            'book' => null,
+            'http' => 409,
+            'body' => 'Not a payment for this invoice',
+            'log' => "Not applied: PawPayments invoice {$orderId} was issued for invoice #{$issued['invoice_id']}",
+        ];
+    }
+
+    if ($issued !== null) {
+        $currency = strtoupper((string) $issued['currency']);
+        $issuedFor = (float) $issued['amount'];
+        $rate = $issuedFor > 0 ? (float) $issued['client_amount'] / $issuedFor : 1.0;
+    } else {
+        // No record of what was asked for: it must be at least what is due.
+        $currency = $clientCurrency;
+        $issuedFor = is_numeric($balance) ? (float) $balance : null;
+        $rate = 1.0;
+    }
 
     switch ($status) {
         case 'success':
         case 'paid_over':
-            // addInvoicePayment() does not deduplicate: a retry delivered while
-            // the first call is still running provisioning hooks would book it again.
-            if ($alreadyRecorded) {
-                return $noop + ['log' => 'Already recorded (repeated delivery), not applied again'];
-            }
-            // `extra` is just an invoice number: the payment must be in the
-            // invoice's currency and cover its total.
-            if (!\PawPayments\Sdk\Webhook::coversAmount($payload, $clientCurrency, $invoiceTotal)) {
+            if ($issuedFor === null || !\PawPayments\Sdk\Webhook::coversAmount($payload, $currency, $issuedFor)) {
                 return [
                     'book' => null,
                     'http' => 409,
                     'body' => 'Amount or currency does not match the invoice',
                     'log' => sprintf(
-                        'Not applied: %s %s received does not cover the invoice total %s %s',
-                        $payload['fiat_amount'] ?? '?',
+                        'Not applied: PawPayments invoice %s was issued for %s %s, expected %s %s',
+                        $orderId,
+                        $payload['initial_fiat_amount'] ?? '?',
                         $payload['fiat_currency'] ?? '?',
-                        $invoiceTotal ?? '?',
-                        $clientCurrency
+                        $issuedFor ?? '?',
+                        $currency
                     ),
                 ];
             }
@@ -114,14 +146,16 @@ function pawpayments_checkout_action(
             // that would leave the invoice Unpaid over cents. Also booked on an
             // invoice meanwhile paid another way: WHMCS turns the surplus into
             // client credit, so the crypto the merchant received stays on record.
+            $paid = max((float) ($payload['fiat_amount'] ?? 0), (float) ($payload['initial_fiat_amount'] ?? 0));
+            $due = round(round($paid * $rate, 2) - $booked, 2);
+            if ($due < 0.01) {
+                return $noop + ['log' => 'Already recorded (repeated delivery), not applied again'];
+            }
             return [
-                'book' => max(
-                    (float) ($payload['fiat_amount'] ?? 0),
-                    (float) ($payload['initial_fiat_amount'] ?? 0)
-                ),
+                'book' => $due,
                 'http' => 200,
                 'body' => 'OK',
-                'log' => 'Successful',
+                'log' => $booked > 0 ? "Successful: {$due} added to the {$booked} already booked for it" : 'Successful',
             ];
 
         case 'partially_paid':
@@ -131,15 +165,19 @@ function pawpayments_checkout_action(
             // An expired invoice the client paid in part: the merchant keeps the
             // partial, so it is booked as a partial payment of the invoice.
             $partial = (float) ($payload['fiat_amount'] ?? 0);
-            if ($partial <= 0 || $alreadyRecorded) {
+            if ($partial <= 0) {
                 return $noop + ['log' => 'Unsuccessful'];
             }
             $partialCurrency = strtoupper((string) ($payload['fiat_currency'] ?? ''));
-            if ($partialCurrency === '' || $partialCurrency !== $clientCurrency) {
+            if ($partialCurrency === '' || $partialCurrency !== $currency) {
                 return $noop + ['log' => 'Expired after a partial payment in another currency, not applied'];
             }
+            $due = round(round($partial * $rate, 2) - $booked, 2);
+            if ($due < 0.01) {
+                return $noop + ['log' => 'Expired after a partial payment, already applied'];
+            }
             return [
-                'book' => $partial,
+                'book' => $due,
                 'http' => 200,
                 'body' => 'OK',
                 'log' => 'Expired after a partial payment, partial applied',
@@ -150,6 +188,15 @@ function pawpayments_checkout_action(
     }
 
     return $noop + ['log' => 'Unknown status: ' . $status];
+}
+
+/**
+ * The transaction id of the next booking for PawPayments invoice $orderId:
+ * its own id, then `<id>-2`, `<id>-3`… for later top-ups of the same invoice.
+ */
+function pawpayments_transaction_id(string $orderId, int $bookedCount): string
+{
+    return $bookedCount === 0 ? $orderId : $orderId . '-' . ($bookedCount + 1);
 }
 
 /**
@@ -213,10 +260,133 @@ function pawpayments_client_currency(int $clientId): string
     return strtoupper((string) ($details['client']['currency_code'] ?? ''));
 }
 
-/** Whether a transaction with this id is already booked (tblaccounts). */
-function pawpayments_transaction_recorded(string $transactionId): bool
+/**
+ * What is booked on $invoiceId for PawPayments invoice $orderId so far:
+ * ['amount' => sum, 'count' => bookings] over the transaction ids
+ * pawpayments_transaction_id() hands out.
+ */
+function pawpayments_booked(int $invoiceId, string $orderId): array
 {
-    return \Illuminate\Database\Capsule\Manager::table('tblaccounts')
-        ->where('transid', $transactionId)
-        ->exists();
+    $rows = \Illuminate\Database\Capsule\Manager::table('tblaccounts')
+        ->where('invoiceid', $invoiceId)
+        ->where(function ($query) use ($orderId) {
+            $query->where('transid', $orderId)->orWhere('transid', 'like', $orderId . '-%');
+        })
+        ->pluck('amountin');
+
+    $amount = 0.0;
+    foreach ($rows as $amountIn) {
+        $amount += (float) $amountIn;
+    }
+
+    return ['amount' => round($amount, 2), 'count' => count($rows)];
+}
+
+/**
+ * Serialise the bookings of one PawPayments invoice across concurrent webhook
+ * deliveries (a MySQL named lock, released by pawpayments_unlock() or when
+ * the request's connection closes). False if it could not be had in 10 s.
+ */
+function pawpayments_lock(string $orderId): bool
+{
+    try {
+        $row = \Illuminate\Database\Capsule\Manager::selectOne(
+            'SELECT GET_LOCK(?, 10) AS acquired',
+            ['pawpayments:' . $orderId]
+        );
+    } catch (\Exception $e) {
+        return false;
+    }
+
+    return $row !== null && (int) $row->acquired === 1;
+}
+
+function pawpayments_unlock(string $orderId): void
+{
+    try {
+        \Illuminate\Database\Capsule\Manager::selectOne('SELECT RELEASE_LOCK(?)', ['pawpayments:' . $orderId]);
+    } catch (\Exception $e) {
+    }
+}
+
+if (!defined('PAWPAYMENTS_ISSUED_TABLE')) {
+    define('PAWPAYMENTS_ISSUED_TABLE', 'mod_pawpayments_invoices');
+}
+
+/**
+ * Lazily create the table of PawPayments invoices issued for WHMCS invoices
+ * (gateway modules have no activation hook).
+ */
+function pawpayments_issued_table_ready(): bool
+{
+    static $ready = null;
+    if ($ready !== null) {
+        return $ready;
+    }
+
+    try {
+        $schema = \Illuminate\Database\Capsule\Manager::schema();
+        if (!$schema->hasTable(PAWPAYMENTS_ISSUED_TABLE)) {
+            $schema->create(PAWPAYMENTS_ISSUED_TABLE, function ($table) {
+                $table->string('order_id', 64)->primary();
+                $table->integer('invoice_id')->unsigned()->index();
+                $table->decimal('amount', 16, 2);
+                $table->string('currency', 8);
+                $table->decimal('client_amount', 16, 2);
+                $table->integer('created_at')->unsigned();
+            });
+        }
+        $ready = true;
+    } catch (\Exception $e) {
+        $ready = false;
+    }
+
+    return $ready;
+}
+
+/**
+ * Remember the PawPayments invoice made for WHMCS invoice $invoiceId: the
+ * $amount and $currency sent (after any "Convert To For Processing") and what
+ * was due then in the client's currency, $clientAmount.
+ */
+function pawpayments_record_issued_invoice(
+    string $orderId,
+    int $invoiceId,
+    float $amount,
+    string $currency,
+    float $clientAmount
+): void {
+    if ($orderId === '' || !pawpayments_issued_table_ready()) {
+        return;
+    }
+
+    try {
+        \Illuminate\Database\Capsule\Manager::table(PAWPAYMENTS_ISSUED_TABLE)->insert([
+            'order_id' => $orderId,
+            'invoice_id' => $invoiceId,
+            'amount' => $amount,
+            'currency' => strtoupper($currency),
+            'client_amount' => $clientAmount,
+            'created_at' => time(),
+        ]);
+    } catch (\Exception $e) {
+    }
+}
+
+/** The record pawpayments_record_issued_invoice() kept for $orderId, if any. */
+function pawpayments_issued_invoice(string $orderId): ?array
+{
+    if ($orderId === '' || !pawpayments_issued_table_ready()) {
+        return null;
+    }
+
+    try {
+        $row = \Illuminate\Database\Capsule\Manager::table(PAWPAYMENTS_ISSUED_TABLE)
+            ->where('order_id', $orderId)
+            ->first();
+    } catch (\Exception $e) {
+        return null;
+    }
+
+    return $row ? (array) $row : null;
 }

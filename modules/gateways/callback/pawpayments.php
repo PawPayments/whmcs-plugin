@@ -24,22 +24,37 @@ if (!$invoiceId || $orderId === '') {
 
 checkCbInvoiceID($invoiceId, $gatewayModule);
 
-// The facts pawpayments_checkout_action() decides on, looked up only for a
-// webhook that may book money on the invoice.
-$invoiceTotal = null;
+// addInvoicePayment() does not deduplicate: two deliveries of one webhook
+// running at once would both see nothing booked yet and both book it.
+if (!pawpayments_lock($orderId)) {
+    http_response_code(503);
+    die('Busy, retry later');
+}
+
+// The facts pawpayments_checkout_action() decides on; the invoice is looked up
+// only for a webhook that may book money on it.
+$issued = pawpayments_issued_invoice($orderId);
+$balance = null;
 $clientCurrency = '';
-$alreadyRecorded = false;
+$booked = ['amount' => 0.0, 'count' => 0];
 if (in_array((string) ($payload['status'] ?? ''), PAWPAYMENTS_SETTLING_STATUSES, true)) {
-    $alreadyRecorded = pawpayments_transaction_recorded($orderId);
+    $booked = pawpayments_booked($invoiceId, $orderId);
     $invoice = localAPI('GetInvoice', ['invoiceid' => $invoiceId]);
-    $invoiceTotal = $invoice['total'] ?? null;
+    $balance = $invoice['balance'] ?? null;
     $clientCurrency = pawpayments_client_currency((int) ($invoice['userid'] ?? 0));
 }
 
-$action = pawpayments_checkout_action($payload, $invoiceTotal, $clientCurrency, $alreadyRecorded);
+$action = pawpayments_checkout_action($payload, $invoiceId, $issued, $balance, $clientCurrency, $booked['amount']);
 if ($action['book'] !== null) {
-    addInvoicePayment($invoiceId, $orderId, $action['book'], 0, $gatewayModule);
+    addInvoicePayment(
+        $invoiceId,
+        pawpayments_transaction_id($orderId, $booked['count']),
+        $action['book'],
+        0,
+        $gatewayModule
+    );
 }
+pawpayments_unlock($orderId);
 logTransaction($gatewayModule, $payload, $action['log']);
 
 http_response_code($action['http']);
