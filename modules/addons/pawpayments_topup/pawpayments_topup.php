@@ -15,7 +15,7 @@ function pawpayments_topup_config()
     return [
         'name' => 'PawPayments Crypto Deposit',
         'description' => 'Allows clients to add funds via cryptocurrency through PawPayments',
-        'version' => '2.0.3',
+        'version' => '2.1.1',
         'author' => 'PawPayments',
         'fields' => [
             'api_key' => [
@@ -75,6 +75,10 @@ function pawpayments_topup_credentials(?array $settings = null): array
     $baseUrl = (string) ($settings['api_base_url'] ?? '') ?: 'https://api.pawpayments.com';
 
     if ($apiKey === '') {
+        // WHMCS loads the gateway functions for callbacks, not for addon pages.
+        if (!function_exists('getGatewayVariables')) {
+            \App::load_function('gateway');
+        }
         $gateway = getGatewayVariables('pawpayments');
         $apiKey = (string) ($gateway['api_key'] ?? '');
         $baseUrl = ($gateway['api_base_url'] ?? '') ?: $baseUrl;

@@ -220,11 +220,13 @@ checkout one. Make sure both endpoints are publicly reachable over HTTPS.
 ### Sanity check via curl (simulating a checkout webhook)
 
 ```bash
+# The PawPayments invoice the "Pay with Crypto" button created for this WHMCS
+# invoice (mod_pawpayments_invoices.order_id), and the amount and currency it
+# was issued for (its `amount` and `currency` columns).
 ORDER_ID="<paw_order_id>"
 INVOICE_ID="<whmcs_invoice_id>"
 KEY="<your_api_key>"
-# fiat_amount / fiat_currency must cover the invoice total in the client's currency
-BODY="{\"order_id\":\"$ORDER_ID\",\"extra\":\"$INVOICE_ID\",\"status\":\"success\",\"fiat_amount\":\"15\",\"fiat_currency\":\"USD\",\"asset\":\"USDT\"}"
+BODY="{\"order_id\":\"$ORDER_ID\",\"extra\":\"$INVOICE_ID\",\"status\":\"success\",\"fiat_amount\":\"15\",\"initial_fiat_amount\":\"15\",\"fiat_currency\":\"USD\",\"asset\":\"USDT\"}"
 SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$KEY" | awk '{print $2}')
 curl -X POST "https://<your-whmcs>/modules/gateways/callback/pawpayments.php" \
   -H "Content-Type: application/json" \
@@ -245,7 +247,7 @@ Expected response: `OK` with HTTP 200, and the invoice changes to **Paid**.
 | Webhook returns HTTP 500 with `Failed to open required init.php` | Old plugin version. The current callback uses `require_once __DIR__ . '/../../../init.php';` (three `..`, not four). Re-upload the latest `callback/pawpayments*.php`. |
 | Webhook returns HTTP 503 `Gateway not configured` | The **API Key** field of the PawPayments gateway is empty. Fill it in. |
 | Webhook returns HTTP 401 `Invalid signature` | The API key in the gateway settings (for top-ups: the addon's key, else the gateway's) does not match the key used to create the invoice. Update the settings and re-issue the invoice. |
-| Checkout webhook returns HTTP 409 | The paid PawPayments invoice is in another currency than the WHMCS invoice or does not cover its total. The Gateway Log has the amounts; apply the payment by hand if appropriate. |
+| Checkout webhook returns HTTP 409 | The paid PawPayments invoice was created for another WHMCS invoice, or is not in the currency / for the amount its payment link asked for (without a record: the client's currency and what is still due). The Gateway Log has the amounts; apply the payment by hand if appropriate. |
 | Top-up addon not visible | Activate it in **Setup → Addon Modules** and grant access to your admin role. |
 | Top-up webhook returns HTTP 503 | Neither the addon nor the gateway has an API key. Set one (the addon falls back to the gateway's key). |
 | Duplicate top-ups | The `mod_pawpayments_credits` table prevents double-credit on the same `order_id`. If the table is missing, re-activate the addon. |
